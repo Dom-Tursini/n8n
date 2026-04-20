@@ -218,17 +218,30 @@ export async function handleMessage(
 
 		let responsePromise: IDeferredPromise<IRun> | undefined = undefined;
 		let responsePromiseHook: IDeferredPromise<IExecuteResponsePromiseData> | undefined = undefined;
-		if (acknowledgeMode !== 'immediately' && acknowledgeMode !== 'laterMessageNode') {
-			responsePromise = this.helpers.createDeferredPromise();
-		} else if (acknowledgeMode === 'laterMessageNode') {
+		if (acknowledgeMode === 'laterMessageNode') {
 			responsePromiseHook = this.helpers.createDeferredPromise<IExecuteResponsePromiseData>();
+			// Also await execution end so we can nack when the run errors
+			// before the Delete-from-Queue node fires sendResponse. Hook
+			// alone cannot distinguish that case: the engine unconditionally
+			// resolves the hook at teardown via resolveExecutionResponsePromise,
+			// so the hook fires even on a crashed run.
+			responsePromise = this.helpers.createDeferredPromise<IRun>();
+		} else if (acknowledgeMode !== 'immediately') {
+			responsePromise = this.helpers.createDeferredPromise();
 		}
-		if (responsePromiseHook) {
-			this.emit([[item]], responsePromiseHook, undefined);
-		} else {
-			this.emit([[item]], undefined, responsePromise);
-		}
-		if (responsePromise && acknowledgeMode !== 'laterMessageNode') {
+		this.emit([[item]], responsePromiseHook, responsePromise);
+		if (acknowledgeMode === 'laterMessageNode' && responsePromise) {
+			// Decide by the final execution state: nack on error (crash
+			// before Delete-from-Queue) so the broker redelivers, ack on
+			// clean completion.
+			const data: IRun = await responsePromise.promise;
+			if (data?.data?.resultData?.error) {
+				channel.nack(message);
+			} else {
+				channel.ack(message);
+			}
+			messageTracker.answered(message);
+		} else if (responsePromise && acknowledgeMode !== 'laterMessageNode') {
 			// Acknowledge message after the execution finished
 			await responsePromise.promise.then(async (data: IRun) => {
 				if (data.data.resultData.error) {
@@ -239,11 +252,6 @@ export async function handleMessage(
 						return;
 					}
 				}
-				channel.ack(message);
-				messageTracker.answered(message);
-			});
-		} else if (responsePromiseHook && acknowledgeMode === 'laterMessageNode') {
-			await responsePromiseHook.promise.then(() => {
 				channel.ack(message);
 				messageTracker.answered(message);
 			});
